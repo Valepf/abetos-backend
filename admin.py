@@ -1,129 +1,194 @@
-# Abetos_app/backend/admin.py
-from flask import Blueprint, request, jsonify, make_response
-from sqlalchemy import func, desc
+# C:\Abetos_app\backend\admin.py
+from functools import wraps
+from flask import Blueprint, request, jsonify
+from flask_jwt_extended import jwt_required, get_jwt
+from sqlalchemy import or_
+
 from db import db
-from models import Customer, Transaction
-from api import roles_required  # tu decorador de roles
+from models import Customer, Transaction, EarningRule
 
 admin_api = Blueprint("admin_api", __name__)
 
-# Tabla de factores: puntos por litro
-POINTS_TABLE = {
-    "INFINIA": 10,
-    "SUPER": 8,
-    # agrega más si es necesario
-}
+# -------------------------
+# Helper: solo admin/clerk
+# -------------------------
+def admin_only(fn):
+    @wraps(fn)
+    @jwt_required()
+    def wrapper(*args, **kwargs):
+        claims = get_jwt() or {}
+        role = claims.get("role", "")
+        if role not in ("admin", "clerk"):
+            return jsonify({"error": "forbidden", "detail": "admin_or_clerk_required"}), 403
+        return fn(*args, **kwargs)
+    return wrapper
 
-def _points_for(product_code: str, liters: float) -> int:
-    if liters is None or liters <= 0:
-        raise ValueError("Litros inválidos")
-    code = (product_code or "").strip().upper()
-    factor = POINTS_TABLE.get(code)
-    if factor is None:
-        raise ValueError("product_code inválido")
-    return int(round(liters * factor))
 
-@admin_api.post("/accredit-by-dni")
-@roles_required("admin", "clerk")
-def accredit_by_dni():
-    """
-    Body:
-    {
-      "doc_number": "32123456",
-      "product_code": "INFINIA|SUPER|...",
-      "liters": 35.0,                  # opcional si mandan amount+unit_price
-      "amount": 3000.0,                # opcional
-      "unit_price": 1796.0,            # opcional
-      "paid_with_app": true|false,
-      "payment_method": "efectivo|debito|credito|qr",
-      "ticket_number": "A001-000123",
-      "note": "texto opcional"
-    }
-    """
-    data = request.get_json(silent=True) or dict(request.form) or {}
+# -------------------------
+# GET /api/admin/customers/find?doc_number=...
+# -------------------------
+@admin_api.get("/customers/find")
+@admin_only
+def customers_find():
+    doc = request.args.get("doc_number") or request.args.get("doc")
+    if not doc:
+        return jsonify({"error": "bad_request", "detail": "doc_number required"}), 400
 
-    doc_number   = (data.get("doc_number") or "").strip()
-    product_code = (data.get("product_code") or "").strip()
-
-    liters      = data.get("liters")
-    amount      = data.get("amount")
-    unit_price  = data.get("unit_price")
-
-    paid_with_app  = bool(data.get("paid_with_app", False))
-    payment_method = data.get("payment_method")
-    ticket_number  = data.get("ticket_number")
-    note           = data.get("note")
-
-    if not doc_number:
-        return jsonify({"error": "doc_number requerido"}), 400
-    if not product_code:
-        return jsonify({"error": "product_code requerido"}), 400
-
-    # Buscar cliente por DNI
-    c = db.session.query(Customer).filter_by(doc_number=doc_number).first()
+    c = Customer.query.filter_by(doc_number=doc).first()
     if not c:
-        return jsonify({"error": "Cliente no encontrado"}), 404
+        return jsonify({"error": "not_found"}), 404
 
-    # Calcular litros si no vinieron, usando amount y unit_price
-    def _to_float(x):
-        try:
-            return float(x) if x is not None and f"{x}".strip() != "" else None
-        except Exception:
-            return None
+    return jsonify({
+        "id": c.id,
+        "full_name": c.full_name,
+        "doc_number": c.doc_number,
+        "phone": c.phone,
+        "member_number": c.member_number,
+        "points_balance": c.points_balance,
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+    })
 
-    liters = _to_float(liters)
-    amount = _to_float(amount)
-    unit_price = _to_float(unit_price)
 
-    if (liters is None or liters <= 0) and (amount and unit_price and amount > 0 and unit_price > 0):
-        liters = round(amount / unit_price, 4)
+# -------------------------
+# GET /api/admin/customers/summary
+#   params: q, limit, offset
+# -------------------------
+@admin_api.get("/customers/summary")
+@admin_only
+def customers_summary():
+    q = (request.args.get("q") or "").strip()
+    limit = int(request.args.get("limit") or request.args.get("size") or 50)
+    offset = int(request.args.get("offset") or 0)
 
-    if liters is None or liters <= 0:
-        return jsonify({"error": "liters inválido (o amount/unit_price inválidos)"}), 400
+    qry = Customer.query
+    if q:
+        like = f"%{q}%"
+        qry = qry.filter(
+            or_(
+                Customer.full_name.ilike(like),
+                Customer.doc_number.ilike(like),
+                Customer.phone.ilike(like),
+                Customer.member_number.ilike(like),
+            )
+        )
 
-    # Calcular puntos
+    total = qry.count()
+    rows = qry.order_by(Customer.created_at.desc()).limit(limit).offset(offset).all()
+
+    data = []
+    for c in rows:
+        data.append({
+            "id": c.id,
+            "full_name": c.full_name,
+            "doc_number": c.doc_number,
+            "phone": c.phone,
+            "member_number": c.member_number,
+            "points_balance": c.points_balance,
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+        })
+
+    return jsonify({"total": total, "items": data})
+
+
+# -------------------------
+# POST /api/admin/accredit-by-dni
+# body:
+#   doc_number (str) *
+#   product_code (str) *
+#   liters (float)  |  (amount, unit_price) -> calcula litros
+#   paid_with_app, payment_method, ticket_number, note (opc)
+# -------------------------
+@admin_api.post("/accredit-by-dni")
+@admin_only
+def accredit_by_dni():
+    body = request.get_json(silent=True) or {}
+    doc_number   = (body.get("doc_number") or "").strip()
+    product_code = (body.get("product_code") or "").strip()
+    liters       = body.get("liters")
+    amount       = body.get("amount")
+    unit_price   = body.get("unit_price")
+    paid_with_app = bool(body.get("paid_with_app") or False)
+    payment_method = (body.get("payment_method") or "").strip() or None
+    ticket_number  = (body.get("ticket_number") or "").strip() or None
+    note           = (body.get("note") or "").strip() or None
+
+    if not doc_number or not product_code:
+        return jsonify({"error": "bad_request", "detail": "doc_number and product_code required"}), 400
+
+    # buscar cliente
+    c = Customer.query.filter_by(doc_number=doc_number).first()
+    if not c:
+        return jsonify({"error": "not_found", "detail": "customer_not_found"}), 404
+
+    # calcular litros si vino amount + unit_price
+    if liters is None:
+        if amount is not None and unit_price is not None:
+            try:
+                a = float(amount)
+                p = float(unit_price)
+                if a <= 0 or p <= 0:
+                    return jsonify({"error": "bad_request", "detail": "invalid amount/unit_price"}), 400
+                liters = round(a / p, 4)
+            except Exception:
+                return jsonify({"error": "bad_request", "detail": "invalid amount/unit_price"}), 400
+        else:
+            return jsonify({"error": "bad_request", "detail": "liters or (amount + unit_price) required"}), 400
+
+    # buscar regla de puntos
+    rule = EarningRule.query.filter_by(product_code=product_code, is_active=True).first()
+    if not rule:
+        return jsonify({"error": "not_found", "detail": "earning_rule_not_found"}), 404
+
+    # soportamos solo reglas por LITERS aquí
+    if (rule.unit or "").upper() != "LITERS":
+        return jsonify({"error": "bad_request", "detail": "rule unit not supported for this endpoint"}), 400
+
     try:
-        earned = _points_for(product_code, liters)
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        liters_f = float(liters)
+    except Exception:
+        return jsonify({"error": "bad_request", "detail": "invalid liters"}), 400
+    if liters_f <= 0:
+        return jsonify({"error": "bad_request", "detail": "liters must be > 0"}), 400
 
-    # Crear transacción y actualizar saldo del cliente
+    # calcular puntos
+    points = int(round(liters_f * float(rule.points_per_unit or 0)))
+
+    # IMPORTANTE: usar 'kind', no 'type'
     tx = Transaction(
         customer_id=c.id,
-        type="accrual",
-        points=int(earned),
+        kind="earn",                    # ← FIX: antes usabas type=...
+        points=points,
         product_code=product_code,
-        liters=float(liters),
-        amount=amount,
-        unit_price=unit_price,
+        liters=liters_f,
+        amount=None if amount is None else float(amount),
+        unit_price=None if unit_price is None else float(unit_price),
         paid_with_app=paid_with_app,
         payment_method=payment_method,
         ticket_number=ticket_number,
         note=note,
+        # purchase_id: opcional si lo usás
     )
-    c.add_points(earned)
-
     db.session.add(tx)
     db.session.commit()
 
     return jsonify({
         "ok": True,
+        "transaction": {
+            "id": tx.id,
+            "customer_id": tx.customer_id,
+            "kind": tx.kind,
+            "points": tx.points,
+            "product_code": tx.product_code,
+            "liters": tx.liters,
+            "payment_method": tx.payment_method,
+            "ticket_number": tx.ticket_number,
+            "note": tx.note,
+            "created_at": tx.created_at.isoformat() if tx.created_at else None,
+        },
         "customer": {
             "id": c.id,
             "full_name": c.full_name,
             "doc_number": c.doc_number,
-            "points_balance": int(c.points_balance or 0),
-        },
-        "transaction": {
-            "id": tx.id,
-            "type": tx.type,
-            "points": tx.points,
-            "product_code": tx.product_code,
-            "liters": tx.liters,
-            "amount": tx.amount,
-            "unit_price": tx.unit_price,
-            "created_at": tx.created_at.isoformat(),
-            "payment_method": tx.payment_method,
-            "ticket_number": tx.ticket_number,
+            "points_balance": c.points_balance,
         }
-    }), 201
+    })
