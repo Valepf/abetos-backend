@@ -8,6 +8,7 @@ from db import db
 from api import api as api_bp
 from admin import admin_api as admin_bp
 
+
 def create_app():
     app = Flask(__name__)
 
@@ -20,6 +21,12 @@ def create_app():
         JWT_TOKEN_LOCATION=["headers"],
         JWT_HEADER_TYPE="Bearer",
         JSON_SORT_KEYS=False,
+
+        # 💡 opciones para que Postgres no rompa la conexión
+        SQLALCHEMY_ENGINE_OPTIONS={
+            "pool_pre_ping": True,   # prueba la conexión antes de usarla
+            "pool_recycle": 300,     # recicla conexiones cada 5 minutos
+        },
     )
 
     # ---------- EXTENSIONES ----------
@@ -27,12 +34,22 @@ def create_app():
     jwt = JWTManager(app)
 
     # ---------- CORS ----------
-    origins = os.getenv("FRONTEND_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
+    # Orígenes por defecto (desarrollo local)
+    default_origins = ",".join([
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+    ])
+    # Si en Render seteás FRONTEND_ORIGINS, pisa estos valores
+    origins_raw = os.getenv("FRONTEND_ORIGINS", default_origins)
+    origins = [o.strip() for o in origins_raw.split(",") if o.strip()]
+
     CORS(
         app,
         resources={
-            r"/api/*":   {"origins": origins},
-            r"/health":  {"origins": origins},
+            r"/api/*":  {"origins": origins},
+            r"/health": {"origins": origins},
         },
         supports_credentials=False,  # usás Bearer, no cookies
         allow_headers=["Content-Type", "Authorization"],
@@ -49,7 +66,7 @@ def create_app():
     # ---------- MODELOS / DB ----------
     with app.app_context():
         import models  # asegura que los modelos se registren
-        db.create_all()  # Nota: create_all no hace ALTER; para nuevas columnas, usar migración/ALTER
+        db.create_all()  # en Postgres crea las tablas si no existen
 
     # ---------- SALUD ----------
     @app.get("/health")
@@ -83,6 +100,7 @@ def create_app():
         return jsonify({"error": "Token expired"}), 401
 
     return app
+
 
 app = create_app()
 
