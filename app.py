@@ -1,12 +1,17 @@
 # C:\Abetos_app\backend\app.py
 import os
+from datetime import timedelta  # ✅ agregado
 from flask import Flask, jsonify
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager
+from dotenv import load_dotenv
 
 from db import db
 from api import api as api_bp
 from admin import admin_api as admin_bp
+
+# Carga variables de entorno desde backend/.env
+load_dotenv()
 
 
 def create_app():
@@ -14,7 +19,10 @@ def create_app():
 
     # ---------- CONFIG ----------
     app.config.update(
-        SQLALCHEMY_DATABASE_URI=os.getenv("SQLALCHEMY_DATABASE_URI", "sqlite:///mi_inventario.db"),
+        SQLALCHEMY_DATABASE_URI=os.getenv(
+            "SQLALCHEMY_DATABASE_URI",
+            "sqlite:///mi_inventario.db"
+        ),
         SQLALCHEMY_TRACK_MODIFICATIONS=False,
         SECRET_KEY=os.getenv("SECRET_KEY", "dev-secret-change-me"),
         JWT_SECRET_KEY=os.getenv("JWT_SECRET_KEY", "dev-jwt-secret"),
@@ -22,10 +30,13 @@ def create_app():
         JWT_HEADER_TYPE="Bearer",
         JSON_SORT_KEYS=False,
 
-        # 💡 opciones para que Postgres no rompa la conexión
+        # ✅ JWT dura 7 días (evita Token expired a cada rato)
+        JWT_ACCESS_TOKEN_EXPIRES=timedelta(days=7),
+
+        # opciones para conexiones (sirve tanto para sqlite como para Postgres)
         SQLALCHEMY_ENGINE_OPTIONS={
-            "pool_pre_ping": True,   # prueba la conexión antes de usarla
-            "pool_recycle": 300,     # recicla conexiones cada 5 minutos
+            "pool_pre_ping": True,
+            "pool_recycle": 300,
         },
     )
 
@@ -34,14 +45,18 @@ def create_app():
     jwt = JWTManager(app)
 
     # ---------- CORS ----------
-    # Orígenes por defecto (desarrollo local)
     default_origins = ",".join([
+        # Web Vite
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:5174",
         "http://127.0.0.1:5174",
+
+        # Expo Web (a veces)
+        "http://localhost:19006",
+        "http://127.0.0.1:19006",
     ])
-    # Si en Render seteás FRONTEND_ORIGINS, pisa estos valores
+
     origins_raw = os.getenv("FRONTEND_ORIGINS", default_origins)
     origins = [o.strip() for o in origins_raw.split(",") if o.strip()]
 
@@ -51,7 +66,7 @@ def create_app():
             r"/api/*":  {"origins": origins},
             r"/health": {"origins": origins},
         },
-        supports_credentials=False,  # usás Bearer, no cookies
+        supports_credentials=False,
         allow_headers=["Content-Type", "Authorization"],
         expose_headers=["Content-Type", "Authorization"],
         methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -66,7 +81,10 @@ def create_app():
     # ---------- MODELOS / DB ----------
     with app.app_context():
         import models  # asegura que los modelos se registren
-        db.create_all()  # en Postgres crea las tablas si no existen
+
+        auto = os.getenv("AUTO_CREATE_DB", "true").lower() == "true"
+        if auto:
+            db.create_all()
 
     # ---------- SALUD ----------
     @app.get("/health")
@@ -106,7 +124,7 @@ app = create_app()
 
 if __name__ == "__main__":
     app.run(
-        host=os.getenv("HOST", "127.0.0.1"),
-        port=int(os.getenv("PORT", "8000")),
-        debug=os.getenv("FLASK_DEBUG", "1") == "1",
+        host="0.0.0.0",
+        port=8000,
+        debug=True,
     )

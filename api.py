@@ -39,9 +39,13 @@ def get_json_body():
     """Acepta JSON o x-www-form-urlencoded; evita 415 del frontend."""
     data = request.get_json(silent=True)
     if data is None:
-        # fallback a form-encoded
         data = dict(request.form) if request.form else {}
     return data or {}
+
+def normalize_doc(doc: str) -> str:
+    """Normaliza DNI: deja solo dígitos (evita puntos/espacios)."""
+    doc = (doc or "").strip()
+    return "".join(ch for ch in doc if ch.isdigit())
 
 def roles_required(*roles):
     """Exige JWT y rol permitido."""
@@ -69,9 +73,11 @@ def auth_register():
     email = (data.get("email") or "").strip().lower()
     password = data.get("password")
     full_name = (data.get("full_name") or "").strip()
-    doc_number = (data.get("doc_number") or "").strip()
+    doc_number = normalize_doc(data.get("doc_number"))
     phone = (data.get("phone") or "").strip()
-    role = (data.get("role") or "customer").lower()
+
+    # 🔒 Seguridad: SIEMPRE customer (no permitimos role desde el cliente)
+    role = "customer"
 
     if not email or not password or not full_name or not doc_number:
         return jsonify({"error": "email, password, full_name y doc_number son obligatorios"}), 400
@@ -87,7 +93,7 @@ def auth_register():
     db.session.add(u)
     db.session.flush()
 
-    member_number = data.get("member_number") or f"A{doc_number[-6:].zfill(6)}"
+    member_number = (data.get("member_number") or "").strip() or f"A{doc_number[-6:].zfill(6)}"
     c = Customer(
         user_id=u.id,
         full_name=full_name,
@@ -98,7 +104,18 @@ def auth_register():
     db.session.add(c)
     db.session.commit()
 
-    # Envío de verificación (opcional)
+    require_verif = os.getenv("REQUIRE_EMAIL_VERIFICATION", "false").lower() == "true"
+    if not require_verif:
+        return jsonify({
+            "ok": True,
+            "message": "Usuario creado. Ya podés iniciar sesión.",
+            "user": {"id": u.id, "email": u.email, "role": u.role},
+            "customer": {
+                "id": c.id, "full_name": c.full_name,
+                "doc_number": c.doc_number, "member_number": c.member_number
+            }
+        }), 201
+
     try:
         link = generate_verify_link(u.id, u.email)
         send_verification_email(u.email, link)
@@ -126,12 +143,11 @@ def auth_register():
 @api.post("/auth/login")
 def auth_login():
     """
-    Parche: acepta email o doc_number; búsqueda de email case-insensitive;
-    errores con 'hint' para depurar credenciales.
+    Acepta email o doc_number; búsqueda de email case-insensitive.
     """
     data = get_json_body()
     email = (data.get("email") or "").strip().lower()
-    doc   = (data.get("doc_number") or "").strip()
+    doc   = normalize_doc(data.get("doc_number"))
     pwd   = data.get("password")
 
     if not pwd:
@@ -139,10 +155,8 @@ def auth_login():
     if not email and not doc:
         return jsonify({"error": "missing_fields", "hint": "email_or_doc_number_required"}), 400
 
-    # Buscar usuario
     u = None
     if email:
-        # Email case-insensitive
         u = User.query.filter(func.lower(User.email) == email).first()
     else:
         c = Customer.query.filter_by(doc_number=doc).first()
@@ -152,7 +166,6 @@ def auth_login():
     if not u:
         return jsonify({"error": "invalid_credentials", "hint": "user_not_found"}), 401
 
-    # Verificar contraseña (hash)
     try:
         ok = u.check_password(pwd)
     except Exception:
@@ -160,7 +173,6 @@ def auth_login():
     if not ok:
         return jsonify({"error": "invalid_credentials", "hint": "bad_password"}), 401
 
-    # ¿Requerir verificación de email?
     require_verif = os.getenv("REQUIRE_EMAIL_VERIFICATION", "false").lower() == "true"
     if require_verif and not getattr(u, "is_verified", False):
         return jsonify({
@@ -169,9 +181,8 @@ def auth_login():
         }), 403
 
     claims = {"role": u.role, "email": u.email}
-    token = create_access_token(identity=str(u.id), additional_claims=claims)
+    token = create_access_token(identity=u.id, additional_claims=claims)
 
-    # Devolvemos info útil para el front
     cust = Customer.query.filter_by(user_id=u.id).first()
     return jsonify({
         "access_token": token,
@@ -211,7 +222,7 @@ def auth_verify():
         return jsonify({"error": "token inválido o expirado"}), 400
 
     u = User.query.get(uid)
-    if not u or u.email.lower() != email:
+    if not u or (u.email or "").lower() != email:
         return jsonify({"error": "usuario no encontrado"}), 404
 
     if not getattr(u, "is_verified", False):
@@ -389,7 +400,6 @@ def redeem_reward(reward_id):
 @api.post("/purchases")
 @roles_required('admin', 'clerk')
 def create_purchase():
-    # Esta ruta queda para flujos por ID; la carga por DNI está en admin.py
     data = get_json_body()
     customer_id = data.get("customer_id")
     user_id = data.get("user_id")
@@ -400,7 +410,6 @@ def create_purchase():
     payment_method = (data.get("payment_method") or None)
     ticket_number = (data.get("ticket_number") or None)
 
-    # buscar cliente
     c = None
     if customer_id:
         c = Customer.query.get(customer_id)
