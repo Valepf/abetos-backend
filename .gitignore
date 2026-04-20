@@ -1,24 +1,8 @@
-﻿# Entorno
-.env
-.env.*
-!.env.example
-
-# Python
-__pycache__/
+﻿__pycache__/
 *.pyc
-
-# Venv
-.venv/
-venv/
-
-# DB local
 *.db
 *.sqlite
 *.sqlite3
-
-# IDE
-.vscode/
-.idea/
-.DS_Store
-
-instance/cd
+.venv/
+venv/
+instance/
