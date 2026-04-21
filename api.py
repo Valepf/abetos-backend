@@ -12,7 +12,7 @@ from flask_jwt_extended import (
 from db import db
 from models import User, Customer, Transaction, EarningRule, Reward
 from rules import find_rule, calculate_points
-from email_utils import generate_verify_link, verify_token, send_verification_email
+
 
 api = Blueprint("api", __name__)
 
@@ -30,10 +30,12 @@ def current_balance(customer_id: int) -> int:
         .scalar() or 0
     )
 
+
 def ensure_member_number(customer: Customer) -> None:
     if not customer.member_number:
         customer.member_number = f"31.{600000 + customer.id:06d}"
         db.session.commit()
+
 
 def get_json_body():
     """Acepta JSON o x-www-form-urlencoded; evita 415 del frontend."""
@@ -42,10 +44,12 @@ def get_json_body():
         data = dict(request.form) if request.form else {}
     return data or {}
 
+
 def normalize_doc(doc: str) -> str:
     """Normaliza DNI: deja solo dígitos (evita puntos/espacios)."""
     doc = (doc or "").strip()
     return "".join(ch for ch in doc if ch.isdigit())
+
 
 def roles_required(*roles):
     """Exige JWT y rol permitido."""
@@ -88,7 +92,8 @@ def auth_register():
     if Customer.query.filter_by(doc_number=doc_number).first():
         return jsonify({"error": "doc_number (DNI) ya registrado"}), 409
 
-    u = User(email=email, role=role, is_verified=False)
+    # ✅ Sin verificación por email (simplificado)
+    u = User(email=email, role=role, is_verified=True)
     u.set_password(password)
     db.session.add(u)
     db.session.flush()
@@ -104,40 +109,15 @@ def auth_register():
     db.session.add(c)
     db.session.commit()
 
-    require_verif = os.getenv("REQUIRE_EMAIL_VERIFICATION", "false").lower() == "true"
-    if not require_verif:
-        return jsonify({
-            "ok": True,
-            "message": "Usuario creado. Ya podés iniciar sesión.",
-            "user": {"id": u.id, "email": u.email, "role": u.role},
-            "customer": {
-                "id": c.id, "full_name": c.full_name,
-                "doc_number": c.doc_number, "member_number": c.member_number
-            }
-        }), 201
-
-    try:
-        link = generate_verify_link(u.id, u.email)
-        send_verification_email(u.email, link)
-        return jsonify({
-            "ok": True,
-            "message": "Usuario creado. Te enviamos un email para activar tu cuenta.",
-            "user": {"id": u.id, "email": u.email, "role": u.role},
-            "customer": {
-                "id": c.id, "full_name": c.full_name,
-                "doc_number": c.doc_number, "member_number": c.member_number
-            }
-        }), 201
-    except Exception:
-        return jsonify({
-            "ok": True,
-            "warn": "Usuario creado, pero no se pudo enviar el email de verificación.",
-            "user": {"id": u.id, "email": u.email, "role": u.role},
-            "customer": {
-                "id": c.id, "full_name": c.full_name,
-                "doc_number": c.doc_number, "member_number": c.member_number
-            }
-        }), 201
+    return jsonify({
+        "ok": True,
+        "message": "Usuario creado. Ya podés iniciar sesión.",
+        "user": {"id": u.id, "email": u.email, "role": u.role},
+        "customer": {
+            "id": c.id, "full_name": c.full_name,
+            "doc_number": c.doc_number, "member_number": c.member_number
+        }
+    }), 201
 
 
 @api.post("/auth/login")
@@ -147,8 +127,8 @@ def auth_login():
     """
     data = get_json_body()
     email = (data.get("email") or "").strip().lower()
-    doc   = normalize_doc(data.get("doc_number"))
-    pwd   = data.get("password")
+    doc = normalize_doc(data.get("doc_number"))
+    pwd = data.get("password")
 
     if not pwd:
         return jsonify({"error": "missing_fields", "hint": "password_required"}), 400
@@ -173,15 +153,10 @@ def auth_login():
     if not ok:
         return jsonify({"error": "invalid_credentials", "hint": "bad_password"}), 401
 
-    require_verif = os.getenv("REQUIRE_EMAIL_VERIFICATION", "false").lower() == "true"
-    if require_verif and not getattr(u, "is_verified", False):
-        return jsonify({
-            "error": "Cuenta no verificada. Revisá tu email o pedí reenvío.",
-            "needs_verification": True
-        }), 403
-
     claims = {"role": u.role, "email": u.email}
-    token = create_access_token(identity=u.id, additional_claims=claims)
+
+    # ✅ FIX: subject (sub) debe ser string
+    token = create_access_token(identity=str(u.id), additional_claims=claims)
 
     cust = Customer.query.filter_by(user_id=u.id).first()
     return jsonify({
@@ -199,60 +174,20 @@ def auth_login():
 @api.get("/auth/me")
 @jwt_required()
 def auth_me():
+    uid = get_jwt_identity()
+    try:
+        uid = int(uid)
+    except Exception:
+        pass
+
     return jsonify({
-        "user_id": get_jwt_identity(),
+        "user_id": uid,
         "claims": {
             "role": get_jwt().get("role"),
             "email": get_jwt().get("email"),
             "exp": get_jwt().get("exp"),
         }
     })
-
-
-@api.get("/auth/verify")
-def auth_verify():
-    token = (request.args.get("token") or "").strip()
-    if not token:
-        return jsonify({"error": "token requerido"}), 400
-    try:
-        data = verify_token(token)
-        uid = int(data["uid"])
-        email = (data["email"] or "").lower()
-    except Exception:
-        return jsonify({"error": "token inválido o expirado"}), 400
-
-    u = User.query.get(uid)
-    if not u or (u.email or "").lower() != email:
-        return jsonify({"error": "usuario no encontrado"}), 404
-
-    if not getattr(u, "is_verified", False):
-        u.is_verified = True
-        u.email_verified_at = datetime.utcnow()
-        db.session.commit()
-
-    return jsonify({"ok": True, "message": "Cuenta verificada. Ya podés iniciar sesión."})
-
-
-@api.post("/auth/resend-verification")
-def resend_verification():
-    data = get_json_body()
-    email = (data.get("email") or "").strip().lower()
-    if not email:
-        return jsonify({"error": "email requerido"}), 400
-
-    u = User.query.filter_by(email=email).first()
-    if not u:
-        return jsonify({"ok": True})
-
-    if getattr(u, "is_verified", False):
-        return jsonify({"ok": True, "message": "La cuenta ya está verificada."})
-
-    link = generate_verify_link(u.id, u.email)
-    try:
-        send_verification_email(u.email, link)
-        return jsonify({"ok": True, "message": "Email de verificación reenviado."})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # ----------------- Perfil del usuario logueado -----------------
@@ -317,10 +252,10 @@ def seed_rules():
     created, updated, errors = 0, 0, []
     for r in rules_in:
         try:
-            pc   = r["product_code"]
+            pc = r["product_code"]
             unit = r["unit"]
-            ppu  = float(r["points_per_unit"])
-            act  = bool(r.get("is_active", True))
+            ppu = float(r["points_per_unit"])
+            act = bool(r.get("is_active", True))
         except Exception:
             errors.append({"input": r, "error": "faltan campos o tipos inválidos"})
             continue
